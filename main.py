@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from datetime import datetime, date
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Union
 from decimal import Decimal
 from enum import Enum
 import json
@@ -47,6 +47,83 @@ class FHIRGenerator:
     def __init__(self, fhir_version: FHIRVersion = FHIRVersion.R4):
         self.fhir_version = fhir_version
         self.resources = []
+        self.UNIT_MAPPING = {
+            "TAB": "{tablet}",
+            "CAP": "{capsule}",
+            "SYR": "mL",
+            "ML": "mL",
+            "MG": "mg",
+            "G": "g"
+        }
+        
+        self.FORM_CODES = {
+            "TAB": "385055001",
+            "CAP": "385056000",
+            "SYR": "385057009",
+            "SUS": "421026006",
+            "INJ": "394899003",
+            "CRE": "385058004",
+            "OIN": "385059007",
+            "SUP": "385060002",
+            "SOL": "385061003",
+            "POW": "385062005",
+            "GEL": "385063000",
+            "LOT": "385064006",
+            "AER": "385065007",
+            "PAS": "421031004",
+            "FIL": "421032006",
+            "IMP": "421033001"
+        }
+        
+        self.REQUIRED_FIELDS = {
+            "Patient": ["identifier", "name", "gender", "birthDate"],
+            "Practitioner": ["identifier", "name"],
+            "Medication": ["code"],
+            "MedicationRequest": ["status", "intent", "subject", "medicationReference"],
+            "Observation": ["status", "code", "subject", "effectiveDateTime"],
+            "AllergyIntolerance": ["patient", "code"],
+            "Condition": ["subject", "code"]
+        }
+        
+        self.VERSION_BASE_URLS = {
+            FHIRVersion.R4: "http://hl7.org/fhir/R4/",
+            FHIRVersion.STU3: "http://hl7.org/fhir/STU3/",
+            FHIRVersion.DSTU2: "http://hl7.org/fhir/DSTU2/"
+        }
+    
+    def _get_resource_base(self, resource_type: str) -> str:
+        return self.VERSION_BASE_URLS.get(self.fhir_version, self.VERSION_BASE_URLS[FHIRVersion.R4])
+    
+    def _parse_name(self, name: str) -> Tuple[List[str], str]:
+        name_parts = name.split()
+        given = name_parts[:-1] if len(name_parts) > 1 else [name]
+        family = name_parts[-1] if len(name_parts) > 1 else ""
+        return given, family
+    
+    def _parse_strength(self, strength: str) -> Tuple[float, str]:
+        if not strength:
+            return 1.0, "mg"
+        
+        parts = strength.split()
+        try:
+            value = float(parts[0])
+            unit = parts[1] if len(parts) > 1 else "mg"
+            return value, unit
+        except (ValueError, IndexError):
+            logger.warning(f"Could not parse strength '{strength}', using defaults")
+            return 1.0, "mg"
+    
+    def _map_unit(self, unit: str) -> str:
+        return self.UNIT_MAPPING.get(unit, unit)
+    
+    def validate_fhir_resource(self, resource: Dict) -> bool:
+        resource_type = resource.get("resourceType")
+        if resource_type in self.REQUIRED_FIELDS:
+            for field in self.REQUIRED_FIELDS[resource_type]:
+                if field not in resource:
+                    logger.warning(f"Missing required field {field} in {resource_type}")
+                    return False
+        return True
     
     def _generate_id(self) -> str:
         return str(uuid.uuid4())
@@ -58,9 +135,7 @@ class FHIRGenerator:
         return dt.isoformat()
     
     def create_patient(self, patient_id: str, name: str, birth_date: date, gender: str) -> Dict:
-        name_parts = name.split()
-        given = name_parts[:-1] if len(name_parts) > 1 else [name]
-        family = name_parts[-1] if len(name_parts) > 1 else ""
+        given, family = self._parse_name(name)
         
         patient = {
             "resourceType": "Patient",
@@ -78,13 +153,14 @@ class FHIRGenerator:
             "birthDate": self._format_date(birth_date)
         }
         
-        self.resources.append(patient)
-        return patient
+        if self.validate_fhir_resource(patient):
+            self.resources.append(patient)
+            return patient
+        else:
+            raise ValueError("Invalid patient resource")
     
     def create_practitioner(self, practitioner_id: str, name: str, qualification: Optional[str] = None) -> Dict:
-        name_parts = name.split()
-        given = name_parts[:-1] if len(name_parts) > 1 else [name]
-        family = name_parts[-1] if len(name_parts) > 1 else ""
+        given, family = self._parse_name(name)
         
         practitioner = {
             "resourceType": "Practitioner",
@@ -110,29 +186,13 @@ class FHIRGenerator:
                 }
             }]
         
-        self.resources.append(practitioner)
-        return practitioner
+        if self.validate_fhir_resource(practitioner):
+            self.resources.append(practitioner)
+            return practitioner
+        else:
+            raise ValueError("Invalid practitioner resource")
     
     def create_medication(self, medication_code: str, name: str, form: str, strength: str) -> Dict:
-        form_codes = {
-            "TAB": "385055001",
-            "CAP": "385056000",
-            "SYR": "385057009",
-            "SUS": "421026006",
-            "INJ": "394899003",
-            "CRE": "385058004",
-            "OIN": "385059007",
-            "SUP": "385060002",
-            "SOL": "385061003",
-            "POW": "385062005",
-            "GEL": "385063000",
-            "LOT": "385064006",
-            "AER": "385065007",
-            "PAS": "421031004",
-            "FIL": "421032006",
-            "IMP": "421033001"
-        }
-        
         medication = {
             "resourceType": "Medication",
             "id": self._generate_id(),
@@ -146,22 +206,14 @@ class FHIRGenerator:
             "form": {
                 "coding": [{
                     "system": "http://snomed.info/sct",
-                    "code": form_codes.get(form, "385055001"),
+                    "code": self.FORM_CODES.get(form, "385055001"),
                     "display": form
                 }]
             }
         }
         
         if strength:
-            strength_value = 1.0
-            strength_unit = "mg"
-            try:
-                parts = strength.split()
-                strength_value = float(parts[0])
-                if len(parts) > 1:
-                    strength_unit = parts[1]
-            except (ValueError, IndexError):
-                logger.warning(f"Could not parse strength '{strength}', using defaults")
+            strength_value, strength_unit = self._parse_strength(strength)
             
             medication["ingredient"] = [{
                 "itemCodeableConcept": {
@@ -183,8 +235,11 @@ class FHIRGenerator:
                 }
             }]
         
-        self.resources.append(medication)
-        return medication
+        if self.validate_fhir_resource(medication):
+            self.resources.append(medication)
+            return medication
+        else:
+            raise ValueError("Invalid medication resource")
     
     def create_medication_request(self, 
                                  patient_id: str, 
@@ -240,13 +295,16 @@ class FHIRGenerator:
             "allowedBoolean": substitution_allowed
         }
         
-        self.resources.append(medication_request)
-        return medication_request
+        if self.validate_fhir_resource(medication_request):
+            self.resources.append(medication_request)
+            return medication_request
+        else:
+            raise ValueError("Invalid medication request resource")
     
     def create_observation(self, 
                           patient_id: str, 
                           code: Coding, 
-                          value: Any,
+                          value: Union[int, float, Decimal, str, bool],
                           effective_datetime: datetime) -> Dict:
         
         observation = {
@@ -284,8 +342,11 @@ class FHIRGenerator:
         elif isinstance(value, bool):
             observation["valueBoolean"] = value
         
-        self.resources.append(observation)
-        return observation
+        if self.validate_fhir_resource(observation):
+            self.resources.append(observation)
+            return observation
+        else:
+            raise ValueError("Invalid observation resource")
     
     def create_allergy_intolerance(self, 
                                   patient_id: str, 
@@ -315,8 +376,11 @@ class FHIRGenerator:
             }
         }
         
-        self.resources.append(allergy)
-        return allergy
+        if self.validate_fhir_resource(allergy):
+            self.resources.append(allergy)
+            return allergy
+        else:
+            raise ValueError("Invalid allergy intolerance resource")
     
     def create_condition(self, 
                         patient_id: str, 
@@ -353,12 +417,16 @@ class FHIRGenerator:
             }
         }
         
-        self.resources.append(condition)
-        return condition
+        if self.validate_fhir_resource(condition):
+            self.resources.append(condition)
+            return condition
+        else:
+            raise ValueError("Invalid condition resource")
     
     def create_bundle(self, 
                      bundle_type: str = "collection",
-                     timestamp: Optional[datetime] = None) -> Dict:
+                     timestamp: Optional[datetime] = None,
+                     clear_after: bool = True) -> Dict:
         
         bundle = {
             "resourceType": "Bundle",
@@ -373,13 +441,16 @@ class FHIRGenerator:
                 "resource": resource
             })
         
+        if clear_after:
+            self.clear_resources()
+        
         return bundle
     
     def clear_resources(self):
         self.resources = []
     
     def to_json(self, indent: int = 2) -> str:
-        bundle = self.create_bundle()
+        bundle = self.create_bundle(clear_after=False)
         return json.dumps(bundle, indent=indent, default=str)
     
     def save_to_file(self, filename: str) -> None:
@@ -394,6 +465,10 @@ class PrescriptionFHIRGenerator:
         self.practitioner_ref = None
         self.prescription_data = None
         self.created_medications = {}
+        self.ICD10_DISPLAY_MAP = {
+            "I10": "Essential (primary) hypertension",
+            "E11.9": "Type 2 diabetes mellitus without complications"
+        }
     
     def _validate_prescription_data(self, prescription_data: Dict):
         required_fields = ["patient", "prescribing_doctor", "items"]
@@ -477,14 +552,9 @@ class PrescriptionFHIRGenerator:
                     substance=allergy.strip()
                 )
         
-        icd10_display_map = {
-            "I10": "Essential (primary) hypertension",
-            "E11.9": "Type 2 diabetes mellitus without complications"
-        }
-        
         for diagnosis in patient_data.get("diagnoses", []):
             if diagnosis and diagnosis.strip():
-                display_text = icd10_display_map.get(diagnosis.strip(), diagnosis.strip())
+                display_text = self.ICD10_DISPLAY_MAP.get(diagnosis.strip(), diagnosis.strip())
                 self.generator.create_condition(
                     patient_id=self.patient_ref,
                     code=diagnosis.strip(),
@@ -506,9 +576,11 @@ class PrescriptionFHIRGenerator:
                     "strength": item["strength"]
                 }
                 
+                unit = self.generator._map_unit(item.get("unit", item["form"]))
+                
                 quantity = Quantity(
                     value=Decimal(str(item["quantity"])),
-                    unit=item.get("unit", item["form"]),
+                    unit=unit,
                     system="http://unitsofmeasure.org"
                 )
                 
@@ -687,12 +759,12 @@ class PrescriptionFHIRGenerator:
                 }
                 segments.append(pcd_segment)
         
-        for item in self.prescription_data["items"]:
+        for idx, item in enumerate(self.prescription_data["items"]):
             lin_segment = {
                 "segment": "LIN",
                 "description": "Line Item",
                 "fields": [
-                    {"tag": "1082", "value": str(self.prescription_data["items"].index(item) + 1)},
+                    {"tag": "1082", "value": str(idx + 1)},
                     {"tag": "C212", "value": [
                         {"tag": "7140", "value": item["medication_code"]},
                         {"tag": "7143", "value": "RXNORM"}
