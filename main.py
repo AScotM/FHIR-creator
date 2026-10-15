@@ -1,1048 +1,528 @@
+
 #!/usr/bin/env python3
 
-from datetime import datetime, date
-from typing import Dict, List, Optional, Any, Tuple, Union
-from decimal import Decimal
-from enum import Enum
+import argparse
 import json
+import random
+import sys
 import uuid
-import logging
+from datetime import date, datetime, timezone
+from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-class FHIRVersion(Enum):
-    R4 = "4.0.1"
-    STU3 = "3.0.2"
-    DSTU2 = "1.0.2"
+FHIR_VERSION = "4.0.1"
 
-class Coding:
-    def __init__(self, system: str, code: str, display: Optional[str] = None):
-        self.system = system
-        self.code = code
-        self.display = display
-    
-    def to_dict(self) -> Dict:
-        result = {"system": self.system, "code": self.code}
-        if self.display:
-            result["display"] = self.display
-        return result
+RXNORM = "http://www.nlm.nih.gov/research/umls/rxnorm"
+LOINC = "http://loinc.org"
+UCUM = "http://unitsofmeasure.org"
+SNOMED = "http://snomed.info/sct"
 
-class Quantity:
-    def __init__(self, value: Decimal, unit: str, system: Optional[str] = None, code: Optional[str] = None):
-        self.value = value
-        self.unit = unit
-        self.system = system
-        self.code = code
-    
-    def to_dict(self) -> Dict:
-        result = {"value": float(self.value), "unit": self.unit}
-        if self.system:
-            result["system"] = self.system
-        if self.code:
-            result["code"] = self.code
-        return result
+SYNTHETIC_MEDICATIONS = [
+    {
+        "code": "29046",
+        "name": "Lisinopril 10 MG Oral Tablet",
+        "form_code": "385055001",
+        "form": "Tablet",
+        "strength": "10 mg",
+        "quantity": 30,
+        "dosage": "Take one tablet by mouth once daily",
+        "frequency": 1,
+        "duration": 30,
+    },
+    {
+        "code": "860975",
+        "name": "Metformin hydrochloride 500 MG Oral Tablet",
+        "form_code": "385055001",
+        "form": "Tablet",
+        "strength": "500 mg",
+        "quantity": 60,
+        "dosage": "Take one tablet by mouth twice daily",
+        "frequency": 2,
+        "duration": 30,
+    },
+]
 
-class FHIRGenerator:
-    def __init__(self, fhir_version: FHIRVersion = FHIRVersion.R4):
-        self.fhir_version = fhir_version
-        self.resources = []
-        self.UNIT_MAPPING = {
-            "TAB": "{tablet}",
-            "CAP": "{capsule}",
-            "SYR": "mL",
-            "ML": "mL",
-            "MG": "mg",
-            "G": "g"
-        }
-        
-        self.FORM_CODES = {
-            "TAB": "385055001",
-            "CAP": "385056000",
-            "SYR": "385057009",
-            "SUS": "421026006",
-            "INJ": "394899003",
-            "CRE": "385058004",
-            "OIN": "385059007",
-            "SUP": "385060002",
-            "SOL": "385061003",
-            "POW": "385062005",
-            "GEL": "385063000",
-            "LOT": "385064006",
-            "AER": "385065007",
-            "PAS": "421031004",
-            "FIL": "421032006",
-            "IMP": "421033001"
-        }
-        
-        self.REQUIRED_FIELDS = {
-            "Patient": ["identifier", "name", "gender", "birthDate"],
-            "Practitioner": ["identifier", "name"],
-            "Medication": ["code"],
-            "MedicationRequest": ["status", "intent", "subject", "medicationReference"],
-            "Observation": ["status", "code", "subject", "effectiveDateTime"],
-            "AllergyIntolerance": ["patient", "code"],
-            "Condition": ["subject", "code"]
-        }
-        
-        self.VERSION_BASE_URLS = {
-            FHIRVersion.R4: "http://hl7.org/fhir/R4/",
-            FHIRVersion.STU3: "http://hl7.org/fhir/STU3/",
-            FHIRVersion.DSTU2: "http://hl7.org/fhir/DSTU2/"
-        }
-    
-    def _get_resource_base(self, resource_type: str) -> str:
-        return self.VERSION_BASE_URLS.get(self.fhir_version, self.VERSION_BASE_URLS[FHIRVersion.R4])
-    
-    def _parse_name(self, name: str) -> Tuple[List[str], str]:
-        name_parts = name.split()
-        given = name_parts[:-1] if len(name_parts) > 1 else [name]
-        family = name_parts[-1] if len(name_parts) > 1 else ""
-        return given, family
-    
-    def _parse_strength(self, strength: str) -> Tuple[float, str]:
-        if not strength:
-            return 1.0, "mg"
-        
-        parts = strength.split()
-        try:
-            value = float(parts[0])
-            unit = parts[1] if len(parts) > 1 else "mg"
-            return value, unit
-        except (ValueError, IndexError):
-            logger.warning(f"Could not parse strength '{strength}', using defaults")
-            return 1.0, "mg"
-    
-    def _map_unit(self, unit: str) -> str:
-        return self.UNIT_MAPPING.get(unit, unit)
-    
-    def validate_fhir_resource(self, resource: Dict) -> bool:
-        resource_type = resource.get("resourceType")
-        if resource_type in self.REQUIRED_FIELDS:
-            for field in self.REQUIRED_FIELDS[resource_type]:
-                if field not in resource:
-                    logger.warning(f"Missing required field {field} in {resource_type}")
-                    return False
-        return True
-    
-    def _generate_id(self) -> str:
-        return str(uuid.uuid4())
-    
-    def _format_date(self, dt: date) -> str:
-        return dt.isoformat()
-    
-    def _format_datetime(self, dt: datetime) -> str:
-        return dt.isoformat()
-    
-    def create_patient(self, patient_id: str, name: str, birth_date: date, gender: str) -> Dict:
-        given, family = self._parse_name(name)
-        
-        patient = {
-            "resourceType": "Patient",
-            "id": patient_id,
-            "identifier": [{
-                "system": "http://hospital.example.org/patients",
-                "value": patient_id
-            }],
-            "name": [{
-                "use": "official",
-                "family": family,
-                "given": given
-            }],
-            "gender": gender.lower(),
-            "birthDate": self._format_date(birth_date)
-        }
-        
-        if self.validate_fhir_resource(patient):
-            self.resources.append(patient)
-            return patient
-        else:
-            raise ValueError("Invalid patient resource")
-    
-    def create_practitioner(self, practitioner_id: str, name: str, qualification: Optional[str] = None) -> Dict:
-        given, family = self._parse_name(name)
-        
-        practitioner = {
-            "resourceType": "Practitioner",
-            "id": practitioner_id,
-            "identifier": [{
-                "system": "http://hospital.example.org/practitioners",
-                "value": practitioner_id
-            }],
-            "name": [{
-                "use": "official",
-                "family": family,
-                "given": given
-            }]
-        }
-        
-        if qualification:
-            practitioner["qualification"] = [{
-                "code": {
-                    "coding": [{
-                        "system": "http://terminology.hl7.org/CodeSystem/v2-0360",
-                        "code": qualification
-                    }]
-                }
-            }]
-        
-        if self.validate_fhir_resource(practitioner):
-            self.resources.append(practitioner)
-            return practitioner
-        else:
-            raise ValueError("Invalid practitioner resource")
-    
-    def create_medication(self, medication_code: str, name: str, form: str, strength: str) -> Dict:
-        medication = {
-            "resourceType": "Medication",
-            "id": self._generate_id(),
-            "code": {
-                "coding": [{
-                    "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-                    "code": medication_code,
-                    "display": name
-                }]
-            },
-            "form": {
-                "coding": [{
-                    "system": "http://snomed.info/sct",
-                    "code": self.FORM_CODES.get(form, "385055001"),
-                    "display": form
-                }]
+FIRST_NAMES = [
+    "Alex",
+    "Jordan",
+    "Morgan",
+    "Taylor",
+    "Casey",
+    "Robin",
+]
+
+LAST_NAMES = [
+    "Example",
+    "Sample",
+    "Demo",
+    "Test",
+    "Synthetic",
+]
+
+GENDERS = ["male", "female", "other"]
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def resource_id():
+    return str(uuid.uuid4())
+
+
+def resource(resource_type, **fields):
+    return {
+        "resourceType": resource_type,
+        "id": resource_id(),
+        **fields,
+    }
+
+
+def reference(item):
+    return {
+        "reference": f"urn:uuid:{item['id']}",
+    }
+
+
+def coding(system, code, display=None):
+    value = {
+        "system": system,
+        "code": code,
+    }
+
+    if display is not None:
+        value["display"] = display
+
+    return {"coding": [value]}
+
+
+def generate_patient(index, rng):
+    first = rng.choice(FIRST_NAMES)
+    last = rng.choice(LAST_NAMES)
+    birth_year = rng.randint(1950, 2000)
+    birth_month = rng.randint(1, 12)
+    birth_day = rng.randint(1, 28)
+
+    return resource(
+        "Patient",
+        identifier=[
+            {
+                "system": "https://example.org/synthetic/patients",
+                "value": f"PAT-{index:06d}",
             }
-        }
-        
-        if strength:
-            strength_value, strength_unit = self._parse_strength(strength)
-            
-            medication["ingredient"] = [{
-                "itemCodeableConcept": {
-                    "coding": [{
-                        "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-                        "code": medication_code,
-                        "display": name
-                    }]
-                },
-                "strength": {
-                    "numerator": {
-                        "value": strength_value,
-                        "unit": strength_unit
-                    },
-                    "denominator": {
-                        "value": 1,
-                        "unit": "unit"
-                    }
-                }
-            }]
-        
-        if self.validate_fhir_resource(medication):
-            self.resources.append(medication)
-            return medication
-        else:
-            raise ValueError("Invalid medication resource")
-    
-    def create_medication_request(self, 
-                                 patient_id: str, 
-                                 practitioner_id: str, 
-                                 medication_id: str,
-                                 intent: str = "order",
-                                 status: str = "active",
-                                 dosage_instruction: str = "",
-                                 quantity: Optional[Quantity] = None,
-                                 refills: Optional[int] = None,
-                                 substitution_allowed: bool = True) -> Dict:
-        
-        medication_request = {
-            "resourceType": "MedicationRequest",
-            "id": self._generate_id(),
-            "status": status,
-            "intent": intent,
-            "authoredOn": self._format_datetime(datetime.now()),
-            "subject": {
-                "reference": f"Patient/{patient_id}"
-            },
-            "requester": {
-                "reference": f"Practitioner/{practitioner_id}"
-            },
-            "medicationReference": {
-                "reference": f"Medication/{medication_id}"
+        ],
+        name=[
+            {
+                "use": "official",
+                "family": last,
+                "given": [first],
             }
-        }
-        
-        if dosage_instruction:
-            medication_request["dosageInstruction"] = [{
-                "text": dosage_instruction,
+        ],
+        gender=rng.choice(GENDERS),
+        birthDate=date(
+            birth_year,
+            birth_month,
+            birth_day,
+        ).isoformat(),
+    )
+
+
+def generate_practitioner(index):
+    return resource(
+        "Practitioner",
+        identifier=[
+            {
+                "system": "https://example.org/synthetic/practitioners",
+                "value": f"DOC-{index:06d}",
+            }
+        ],
+        name=[
+            {
+                "use": "official",
+                "family": "Example",
+                "given": ["Jane"],
+                "prefix": ["Dr"],
+            }
+        ],
+    )
+
+
+def generate_medication(template):
+    return resource(
+        "Medication",
+        code=coding(
+            RXNORM,
+            template["code"],
+            template["name"],
+        ),
+        form=coding(
+            SNOMED,
+            template["form_code"],
+            template["form"],
+        ),
+    )
+
+
+def generate_observation(patient, rng):
+    weight = round(rng.uniform(55, 105), 1)
+
+    return resource(
+        "Observation",
+        status="final",
+        category=[
+            coding(
+                "http://terminology.hl7.org/CodeSystem/observation-category",
+                "vital-signs",
+                "Vital Signs",
+            )
+        ],
+        code=coding(
+            LOINC,
+            "29463-7",
+            "Body weight",
+        ),
+        subject=reference(patient),
+        effectiveDateTime=utc_now(),
+        valueQuantity={
+            "value": weight,
+            "unit": "kg",
+            "system": UCUM,
+            "code": "kg",
+        },
+    )
+
+
+def generate_medication_request(
+    patient,
+    practitioner,
+    medication,
+    template,
+):
+    return resource(
+        "MedicationRequest",
+        status="active",
+        intent="order",
+        medicationReference=reference(medication),
+        subject=reference(patient),
+        requester=reference(practitioner),
+        authoredOn=utc_now(),
+        dosageInstruction=[
+            {
+                "text": template["dosage"],
                 "timing": {
                     "repeat": {
-                        "frequency": 1,
+                        "frequency": template["frequency"],
                         "period": 1,
-                        "periodUnit": "d"
+                        "periodUnit": "d",
                     }
-                }
-            }]
-        
-        if quantity:
-            if "dispenseRequest" not in medication_request:
-                medication_request["dispenseRequest"] = {}
-            medication_request["dispenseRequest"]["quantity"] = quantity.to_dict()
-        
-        if refills is not None:
-            if "dispenseRequest" not in medication_request:
-                medication_request["dispenseRequest"] = {}
-            medication_request["dispenseRequest"]["numberOfRepeatsAllowed"] = refills
-        
-        medication_request["substitution"] = {
-            "allowedBoolean": substitution_allowed
-        }
-        
-        if self.validate_fhir_resource(medication_request):
-            self.resources.append(medication_request)
-            return medication_request
-        else:
-            raise ValueError("Invalid medication request resource")
-    
-    def create_observation(self, 
-                          patient_id: str, 
-                          code: Coding, 
-                          value: Union[int, float, Decimal, str, bool],
-                          effective_datetime: datetime) -> Dict:
-        
-        observation = {
-            "resourceType": "Observation",
-            "id": self._generate_id(),
-            "status": "final",
-            "category": [{
-                "coding": [{
-                    "system": "http://terminology.hl7.org/CodeSystem/observation-category",
-                    "code": "vital-signs",
-                    "display": "Vital Signs"
-                }]
-            }],
-            "code": {
-                "coding": [code.to_dict()]
-            },
-            "subject": {
-                "reference": f"Patient/{patient_id}"
-            },
-            "effectiveDateTime": self._format_datetime(effective_datetime)
-        }
-        
-        if isinstance(value, (int, float, Decimal)):
-            observation["valueQuantity"] = {"value": float(value)}
-            if code.code == "29463-7":
-                observation["valueQuantity"]["unit"] = "kg"
-                observation["valueQuantity"]["system"] = "http://unitsofmeasure.org"
-                observation["valueQuantity"]["code"] = "kg"
-            elif code.code == "8302-2":
-                observation["valueQuantity"]["unit"] = "cm"
-                observation["valueQuantity"]["system"] = "http://unitsofmeasure.org"
-                observation["valueQuantity"]["code"] = "cm"
-        elif isinstance(value, str):
-            observation["valueString"] = value
-        elif isinstance(value, bool):
-            observation["valueBoolean"] = value
-        
-        if self.validate_fhir_resource(observation):
-            self.resources.append(observation)
-            return observation
-        else:
-            raise ValueError("Invalid observation resource")
-    
-    def create_allergy_intolerance(self, 
-                                  patient_id: str, 
-                                  substance: str, 
-                                  clinical_status: str = "active") -> Dict:
-        
-        allergy = {
-            "resourceType": "AllergyIntolerance",
-            "id": self._generate_id(),
-            "clinicalStatus": {
-                "coding": [{
-                    "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
-                    "code": clinical_status
-                }]
-            },
-            "verificationStatus": {
-                "coding": [{
-                    "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-verification",
-                    "code": "confirmed"
-                }]
-            },
-            "code": {
-                "text": substance
-            },
-            "patient": {
-                "reference": f"Patient/{patient_id}"
+                },
+                "route": {
+                    "text": "Oral",
+                },
             }
-        }
-        
-        if self.validate_fhir_resource(allergy):
-            self.resources.append(allergy)
-            return allergy
-        else:
-            raise ValueError("Invalid allergy intolerance resource")
-    
-    def create_condition(self, 
-                        patient_id: str, 
-                        code: str, 
-                        display: str, 
-                        clinical_status: str = "active") -> Dict:
-        
-        condition_display = display if display else code
-        
-        condition = {
-            "resourceType": "Condition",
-            "id": self._generate_id(),
-            "clinicalStatus": {
-                "coding": [{
-                    "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
-                    "code": clinical_status
-                }]
+        ],
+        dispenseRequest={
+            "quantity": {
+                "value": template["quantity"],
+                "unit": "tablet",
+                "system": UCUM,
+                "code": "{tbl}",
             },
-            "verificationStatus": {
-                "coding": [{
-                    "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
-                    "code": "confirmed"
-                }]
+            "expectedSupplyDuration": {
+                "value": template["duration"],
+                "unit": "days",
+                "system": UCUM,
+                "code": "d",
             },
-            "code": {
-                "coding": [{
-                    "system": "http://hl7.org/fhir/sid/icd-10",
-                    "code": code,
-                    "display": condition_display
-                }]
-            },
-            "subject": {
-                "reference": f"Patient/{patient_id}"
-            }
-        }
-        
-        if self.validate_fhir_resource(condition):
-            self.resources.append(condition)
-            return condition
-        else:
-            raise ValueError("Invalid condition resource")
-    
-    def create_bundle(self, 
-                     bundle_type: str = "collection",
-                     timestamp: Optional[datetime] = None,
-                     clear_after: bool = True) -> Dict:
-        
-        bundle = {
-            "resourceType": "Bundle",
-            "id": self._generate_id(),
-            "type": bundle_type,
-            "timestamp": self._format_datetime(timestamp or datetime.now()),
-            "entry": []
-        }
-        
-        for resource in self.resources:
-            bundle["entry"].append({
-                "resource": resource
-            })
-        
-        if clear_after:
-            self.clear_resources()
-        
-        return bundle
-    
-    def clear_resources(self):
-        self.resources = []
-    
-    def to_json(self, indent: int = 2) -> str:
-        bundle = self.create_bundle(clear_after=False)
-        return json.dumps(bundle, indent=indent, default=str)
-    
-    def save_to_file(self, filename: str) -> None:
-        with open(filename, 'w') as f:
-            f.write(self.to_json())
-        logger.info(f"FHIR Bundle saved to {filename}")
+            "numberOfRepeatsAllowed": 0,
+        },
+        substitution={
+            "allowedBoolean": True,
+        },
+    )
 
-class PrescriptionFHIRGenerator:
-    def __init__(self):
-        self.generator = FHIRGenerator()
-        self.patient_ref = None
-        self.practitioner_ref = None
-        self.prescription_data = None
-        self.created_medications = {}
-        self.ICD10_DISPLAY_MAP = {
-            "I10": "Essential (primary) hypertension",
-            "E11.9": "Type 2 diabetes mellitus without complications"
-        }
-    
-    def _validate_prescription_data(self, prescription_data: Dict):
-        required_fields = ["patient", "prescribing_doctor", "items"]
-        for field in required_fields:
-            if field not in prescription_data:
-                raise ValueError(f"Missing required field: {field}")
-        
-        patient_required = ["patient_id", "name", "date_of_birth", "gender"]
-        for field in patient_required:
-            if field not in prescription_data["patient"]:
-                raise ValueError(f"Missing required patient field: {field}")
-        
-        doctor_required = ["id", "name"]
-        for field in doctor_required:
-            if field not in prescription_data["prescribing_doctor"]:
-                raise ValueError(f"Missing required doctor field: {field}")
-    
-    def create_prescription(self, prescription_data: Dict) -> str:
-        self.prescription_data = prescription_data
-        self._validate_prescription_data(prescription_data)
-        
-        patient_data = prescription_data["patient"]
-        doctor_data = prescription_data["prescribing_doctor"]
-        
-        try:
-            birth_date = datetime.strptime(patient_data["date_of_birth"], "%Y%m%d").date()
-        except ValueError:
-            raise ValueError(f"Invalid date format: {patient_data['date_of_birth']}. Expected YYYYMMDD")
-        
-        patient = self.generator.create_patient(
-            patient_id=patient_data["patient_id"],
-            name=patient_data["name"],
-            birth_date=birth_date,
-            gender=patient_data["gender"]
+
+def generate_prescription(index, rng):
+    patient = generate_patient(index, rng)
+    practitioner = generate_practitioner(index)
+
+    selected = rng.choice(SYNTHETIC_MEDICATIONS)
+
+    medication = generate_medication(selected)
+
+    observation = generate_observation(patient, rng)
+
+    request = generate_medication_request(
+        patient,
+        practitioner,
+        medication,
+        selected,
+    )
+
+    return [
+        patient,
+        practitioner,
+        medication,
+        observation,
+        request,
+    ]
+
+
+def build_bundle(resources):
+    return {
+        "resourceType": "Bundle",
+        "id": resource_id(),
+        "type": "collection",
+        "timestamp": utc_now(),
+        "entry": [
+            {
+                "fullUrl": f"urn:uuid:{item['id']}",
+                "resource": item,
+            }
+            for item in resources
+        ],
+    }
+
+
+def validate_bundle(bundle):
+    if bundle.get("resourceType") != "Bundle":
+        raise ValueError("Invalid Bundle resource type")
+
+    if bundle.get("type") != "collection":
+        raise ValueError("Invalid Bundle type")
+
+    entries = bundle.get("entry")
+
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Bundle has no entries")
+
+    urls = set()
+
+    for entry in entries:
+        item = entry.get("resource")
+
+        if not isinstance(item, dict):
+            raise ValueError("Invalid Bundle entry")
+
+        if not item.get("resourceType") or not item.get("id"):
+            raise ValueError("Resource type or ID missing")
+
+        expected = f"urn:uuid:{item['id']}"
+        actual = entry.get("fullUrl")
+
+        if actual != expected:
+            raise ValueError("Resource fullUrl mismatch")
+
+        if actual in urls:
+            raise ValueError("Duplicate resource fullUrl")
+
+        urls.add(actual)
+
+    required_references = {
+        "Observation": ["subject"],
+        "MedicationRequest": [
+            "subject",
+            "requester",
+            "medicationReference",
+        ],
+    }
+
+    for entry in entries:
+        item = entry["resource"]
+        kind = item["resourceType"]
+
+        for field in required_references.get(kind, []):
+            target = item.get(field, {}).get("reference")
+
+            if target not in urls:
+                raise ValueError(
+                    f"Unresolved reference in {kind}.{field}"
+                )
+
+    return True
+
+
+def count_resources(bundle):
+    counts = {}
+
+    for entry in bundle["entry"]:
+        kind = entry["resource"]["resourceType"]
+        counts[kind] = counts.get(kind, 0) + 1
+
+    return counts
+
+
+def generate_bundle(count, seed):
+    rng = random.Random(seed)
+
+    resources = []
+
+    for index in range(1, count + 1):
+        resources.extend(
+            generate_prescription(index, rng)
         )
-        self.patient_ref = patient_data["patient_id"]
-        
-        practitioner = self.generator.create_practitioner(
-            practitioner_id=doctor_data["id"],
-            name=doctor_data["name"],
-            qualification=doctor_data.get("qualification")
+
+    bundle = build_bundle(resources)
+    validate_bundle(bundle)
+
+    return bundle
+
+
+def save_bundle(bundle, path, overwrite):
+    path = Path(path)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    mode = "w" if overwrite else "x"
+
+    with path.open(mode, encoding="utf-8") as handle:
+        json.dump(
+            bundle,
+            handle,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
         )
-        self.practitioner_ref = doctor_data["id"]
-        
-        if patient_data.get("weight_kg"):
-            try:
-                weight_value = Decimal(patient_data["weight_kg"])
-                self.generator.create_observation(
-                    patient_id=self.patient_ref,
-                    code=Coding(
-                        system="http://loinc.org",
-                        code="29463-7",
-                        display="Body weight"
-                    ),
-                    value=weight_value,
-                    effective_datetime=datetime.now()
-                )
-            except Exception as e:
-                logger.warning(f"Could not create weight observation: {e}")
-        
-        if patient_data.get("height_cm"):
-            try:
-                height_value = Decimal(patient_data["height_cm"])
-                self.generator.create_observation(
-                    patient_id=self.patient_ref,
-                    code=Coding(
-                        system="http://loinc.org",
-                        code="8302-2",
-                        display="Body height"
-                    ),
-                    value=height_value,
-                    effective_datetime=datetime.now()
-                )
-            except Exception as e:
-                logger.warning(f"Could not create height observation: {e}")
-        
-        for allergy in patient_data.get("allergies", []):
-            if allergy and allergy.strip():
-                self.generator.create_allergy_intolerance(
-                    patient_id=self.patient_ref,
-                    substance=allergy.strip()
-                )
-        
-        for diagnosis in patient_data.get("diagnoses", []):
-            if diagnosis and diagnosis.strip():
-                display_text = self.ICD10_DISPLAY_MAP.get(diagnosis.strip(), diagnosis.strip())
-                self.generator.create_condition(
-                    patient_id=self.patient_ref,
-                    code=diagnosis.strip(),
-                    display=display_text
-                )
-        
-        for item in prescription_data["items"]:
-            try:
-                medication = self.generator.create_medication(
-                    medication_code=item["medication_code"],
-                    name=item["medication_name"],
-                    form=item["form"],
-                    strength=item["strength"]
-                )
-                
-                self.created_medications[medication["id"]] = {
-                    "name": item["medication_name"],
-                    "code": item["medication_code"],
-                    "strength": item["strength"]
-                }
-                
-                unit = self.generator._map_unit(item.get("unit", item["form"]))
-                
-                quantity = Quantity(
-                    value=Decimal(str(item["quantity"])),
-                    unit=unit,
-                    system="http://unitsofmeasure.org"
-                )
-                
-                self.generator.create_medication_request(
-                    patient_id=self.patient_ref,
-                    practitioner_id=self.practitioner_ref,
-                    medication_id=medication["id"],
-                    dosage_instruction=item["dosage_instruction"],
-                    quantity=quantity,
-                    refills=item.get("refills"),
-                    substitution_allowed=item.get("substitution_allowed", True)
-                )
-            except Exception as e:
-                logger.error(f"Error creating medication for {item.get('medication_name', 'unknown')}: {e}")
-                raise
-        
-        return self.generator.to_json()
-    
-    def create_edifact_like_response(self) -> Dict:
-        if not self.prescription_data:
-            raise ValueError("No prescription data available. Call create_prescription first.")
-        
-        patient_data = self.prescription_data["patient"]
-        doctor_data = self.prescription_data["prescribing_doctor"]
-        
-        segments = []
-        
-        unh_segment = {
-            "segment": "UNH",
-            "description": "Message Header",
-            "fields": [
-                {"tag": "0062", "value": "PRESCR01"},
-                {"tag": "S009", "value": [
-                    {"tag": "0065", "value": "PRESCR"},
-                    {"tag": "0052", "value": "D"},
-                    {"tag": "0054", "value": "96A"},
-                    {"tag": "0051", "value": "UN"}
-                ]}
-            ]
-        }
-        segments.append(unh_segment)
-        
-        bgm_segment = {
-            "segment": "BGM",
-            "description": "Beginning of Message",
-            "fields": [
-                {"tag": "C002", "value": [
-                    {"tag": "1001", "value": "230"}
-                ]},
-                {"tag": "1004", "value": f"PRES{datetime.now().strftime('%Y%m%d%H%M%S')}"},
-                {"tag": "1225", "value": "9"}
-            ]
-        }
-        segments.append(bgm_segment)
-        
-        dtm_segment = {
-            "segment": "DTM",
-            "description": "Date/Time/Period",
-            "fields": [
-                {"tag": "C507", "value": [
-                    {"tag": "2005", "value": "137"},
-                    {"tag": "2380", "value": datetime.now().strftime('%Y%m%d%H%M')},
-                    {"tag": "2379", "value": "203"}
-                ]}
-            ]
-        }
-        segments.append(dtm_segment)
-        
-        nad_segment_prescriber = {
-            "segment": "NAD",
-            "description": "Prescriber Information",
-            "fields": [
-                {"tag": "3035", "value": "PZ"},
-                {"tag": "C082", "value": [
-                    {"tag": "3039", "value": doctor_data["id"]},
-                    {"tag": "1131", "value": "91"}
-                ]},
-                {"tag": "C080", "value": [
-                    {"tag": "3036", "value": doctor_data["name"]}
-                ]},
-                {"tag": "C059", "value": [
-                    {"tag": "3042", "value": "MEDICAL CENTER"}
-                ]}
-            ]
-        }
-        segments.append(nad_segment_prescriber)
-        
-        nad_segment_patient = {
-            "segment": "NAD",
-            "description": "Patient Information",
-            "fields": [
-                {"tag": "3035", "value": "PT"},
-                {"tag": "C082", "value": [
-                    {"tag": "3039", "value": patient_data["patient_id"]},
-                    {"tag": "1131", "value": "PAT"}
-                ]},
-                {"tag": "C080", "value": [
-                    {"tag": "3036", "value": patient_data["name"]}
-                ]},
-                {"tag": "C059", "value": [
-                    {"tag": "3042", "value": "RESIDENCE"}
-                ]}
-            ]
-        }
-        segments.append(nad_segment_patient)
-        
-        dtm_segment_patient = {
-            "segment": "DTM",
-            "description": "Patient Date of Birth",
-            "fields": [
-                {"tag": "C507", "value": [
-                    {"tag": "2005", "value": "329"},
-                    {"tag": "2380", "value": patient_data["date_of_birth"]},
-                    {"tag": "2379", "value": "102"}
-                ]}
-            ]
-        }
-        segments.append(dtm_segment_patient)
-        
-        pat_segment = {
-            "segment": "PAT",
-            "description": "Patient Demographic Information",
-            "fields": [
-                {"tag": "C056", "value": [
-                    {"tag": "3494", "value": patient_data["gender"].upper()}
-                ]}
-            ]
-        }
-        segments.append(pat_segment)
-        
-        if patient_data.get("allergies"):
-            alc_segment = {
-                "segment": "ALC",
-                "description": "Allergy Information",
-                "fields": [
-                    {"tag": "5463", "value": "3"}
-                ]
-            }
-            segments.append(alc_segment)
-            
-            for allergy in patient_data["allergies"]:
-                pcd_segment = {
-                    "segment": "PCD",
-                    "description": "Allergy Details",
-                    "fields": [
-                        {"tag": "C501", "value": [
-                            {"tag": "1045", "value": "ALG"},
-                            {"tag": "1131", "value": allergy}
-                        ]}
-                    ]
-                }
-                segments.append(pcd_segment)
-        
-        if patient_data.get("diagnoses"):
-            diag_segment = {
-                "segment": "DGS",
-                "description": "Diagnosis Information",
-                "fields": [
-                    {"tag": "C078", "value": [
-                        {"tag": "1153", "value": "ICD10"}
-                    ]}
-                ]
-            }
-            segments.append(diag_segment)
-            
-            for diagnosis in patient_data["diagnoses"]:
-                pcd_segment = {
-                    "segment": "PCD",
-                    "description": "Diagnosis Details",
-                    "fields": [
-                        {"tag": "C501", "value": [
-                            {"tag": "1045", "value": "DG"},
-                            {"tag": "1131", "value": diagnosis}
-                        ]}
-                    ]
-                }
-                segments.append(pcd_segment)
-        
-        for idx, item in enumerate(self.prescription_data["items"]):
-            lin_segment = {
-                "segment": "LIN",
-                "description": "Line Item",
-                "fields": [
-                    {"tag": "1082", "value": str(idx + 1)},
-                    {"tag": "C212", "value": [
-                        {"tag": "7140", "value": item["medication_code"]},
-                        {"tag": "7143", "value": "RXNORM"}
-                    ]}
-                ]
-            }
-            segments.append(lin_segment)
-            
-            imd_segment = {
-                "segment": "IMD",
-                "description": "Item Description",
-                "fields": [
-                    {"tag": "C273", "value": [
-                        {"tag": "7008", "value": item["medication_name"]}
-                    ]}
-                ]
-            }
-            segments.append(imd_segment)
-            
-            mea_segment = {
-                "segment": "MEA",
-                "description": "Measurements",
-                "fields": [
-                    {"tag": "C502", "value": [
-                        {"tag": "6313", "value": "STR"}
-                    ]},
-                    {"tag": "C174", "value": [
-                        {"tag": "6411", "value": "UT"},
-                        {"tag": "6314", "value": item["strength"]}
-                    ]}
-                ]
-            }
-            segments.append(mea_segment)
-            
-            qty_segment = {
-                "segment": "QTY",
-                "description": "Quantity",
-                "fields": [
-                    {"tag": "C186", "value": [
-                        {"tag": "6063", "value": "1"},
-                        {"tag": "6060", "value": str(item["quantity"])},
-                        {"tag": "6411", "value": item.get("unit", "TAB")}
-                    ]}
-                ]
-            }
-            segments.append(qty_segment)
-            
-            rff_segment = {
-                "segment": "RFF",
-                "description": "Prescription Reference",
-                "fields": [
-                    {"tag": "C506", "value": [
-                        {"tag": "1153", "value": "RF"},
-                        {"tag": "1154", "value": str(item.get("refills", 0))}
-                    ]}
-                ]
-            }
-            segments.append(rff_segment)
-            
-            ftx_segment = {
-                "segment": "FTX",
-                "description": "Free Text Instructions",
-                "fields": [
-                    {"tag": "4451", "value": "INS"},
-                    {"tag": "C107", "value": [
-                        {"tag": "4441", "value": "1"}
-                    ]},
-                    {"tag": "C108", "value": [
-                        {"tag": "4440", "value": item["dosage_instruction"]}
-                    ]}
-                ]
-            }
-            segments.append(ftx_segment)
-            
-            if item.get("special_instructions"):
-                ftx_special_segment = {
-                    "segment": "FTX",
-                    "description": "Special Instructions",
-                    "fields": [
-                        {"tag": "4451", "value": "SPI"},
-                        {"tag": "C107", "value": [
-                            {"tag": "4441", "value": "2"}
-                        ]},
-                        {"tag": "C108", "value": [
-                            {"tag": "4440", "value": item["special_instructions"]}
-                        ]}
-                    ]
-                }
-                segments.append(ftx_special_segment)
-        
-        unt_segment = {
-            "segment": "UNT",
-            "description": "Message Trailer",
-            "fields": [
-                {"tag": "0074", "value": str(len(segments) + 1)},
-                {"tag": "0062", "value": f"PRES{datetime.now().strftime('%Y%m%d%H%M%S')}"}
-            ]
-        }
-        segments.append(unt_segment)
-        
-        edifact_response = {
-            "message_type": "PRESCR",
-            "message_version": "96A",
-            "message_release": "D",
-            "controlling_agency": "UN",
-            "interchange_control_reference": f"PRES{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            "timestamp": datetime.now().isoformat(),
-            "segments": segments,
-            "segment_count": len(segments),
-            "summary": {
-                "patient": {
-                    "id": patient_data["patient_id"],
-                    "name": patient_data["name"],
-                    "date_of_birth": patient_data["date_of_birth"],
-                    "gender": patient_data["gender"]
-                },
-                "prescriber": {
-                    "id": doctor_data["id"],
-                    "name": doctor_data["name"],
-                    "qualification": doctor_data.get("qualification", "")
-                },
-                "items_count": len(self.prescription_data["items"]),
-                "total_quantity": sum(int(item["quantity"]) for item in self.prescription_data["items"]),
-                "allergies_count": len(patient_data.get("allergies", [])),
-                "diagnoses_count": len(patient_data.get("diagnoses", []))
-            }
-        }
-        
-        return edifact_response
-    
-    def get_dual_response(self) -> Dict:
-        fhir_json = json.loads(self.generator.to_json())
-        edifact_json = self.create_edifact_like_response()
-        
-        return {
-            "response": {
-                "timestamp": datetime.now().isoformat(),
-                "status": "success",
-                "response_id": str(uuid.uuid4())
-            },
-            "formats": {
-                "fhir": {
-                    "format": "FHIR R4",
-                    "bundle_type": fhir_json.get("type", "collection"),
-                    "resource_count": len(fhir_json.get("entry", [])),
-                    "data": fhir_json
-                },
-                "edifact": {
-                    "format": "EDIFACT-like JSON",
-                    "message_type": "PRESCR",
-                    "segment_count": edifact_json.get("segment_count", 0),
-                    "data": edifact_json
-                }
-            },
-            "metadata": {
-                "generated_at": datetime.now().isoformat(),
-                "patient_id": self.patient_ref,
-                "practitioner_id": self.practitioner_ref,
-                "medication_count": len(self.created_medications)
-            }
-        }
+        handle.write("\n")
+
+
+def print_summary(bundle, count, destination):
+    counts = count_resources(bundle)
+
+    print()
+    print("FHIR Creator 3.0")
+    print("=" * 52)
+    print(f"FHIR version       : R4 ({FHIR_VERSION})")
+    print(f"Bundle type        : {bundle['type']}")
+    print(f"Prescriptions      : {count}")
+    print(f"Total resources    : {len(bundle['entry'])}")
+    print(f"Generated UTC      : {bundle['timestamp']}")
+    print(f"Output             : {destination}")
+    print()
+
+    print("Resource Summary")
+    print("-" * 52)
+
+    width = max(len(name) for name in counts)
+
+    for name, total in sorted(counts.items()):
+        print(f"{name:<{width}} : {total}")
+
+    print()
+    print("Internal reference validation: passed")
+    print("Full FHIR conformance validation: not performed")
+    print()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate synthetic FHIR R4 prescription bundles"
+    )
+
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Number of synthetic prescriptions",
+    )
+
+    parser.add_argument(
+        "--output",
+        default="prescription_fhir.json",
+        help="Output JSON filename",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for synthetic data",
+    )
+
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print the FHIR Bundle to standard output",
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing output file",
+    )
+
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress the terminal summary",
+    )
+
+    return parser.parse_args()
+
 
 def main():
-    prescription_data = {
-        "prescribing_doctor": {
-            "id": "DOC987654321",
-            "name": "Dr. Jane Smith",
-            "qualification": "MD"
-        },
-        "patient": {
-            "patient_id": "PAT123456789",
-            "name": "John Doe",
-            "date_of_birth": "19800515",
-            "gender": "M",
-            "weight_kg": "85.5",
-            "height_cm": "180.0",
-            "allergies": ["Penicillin", "Sulfa drugs"],
-            "diagnoses": ["I10", "E11.9"]
-        },
-        "items": [
-            {
-                "medication_code": "206765",
-                "medication_name": "Lisinopril",
-                "form": "TAB",
-                "strength": "10 mg",
-                "quantity": "30",
-                "unit": "TAB",
-                "dosage_instruction": "Take 1 tablet once daily in the morning",
-                "route": "PO",
-                "duration_days": 30,
-                "refills": 3,
-                "special_instructions": "Take with food if stomach upset occurs",
-                "substitution_allowed": True
-            },
-            {
-                "medication_code": "861007",
-                "medication_name": "Metformin",
-                "form": "TAB",
-                "strength": "500 mg",
-                "quantity": "60",
-                "unit": "TAB",
-                "dosage_instruction": "Take 1 tablet twice daily with meals",
-                "route": "PO",
-                "duration_days": 30,
-                "refills": 3,
-                "special_instructions": "Monitor blood glucose levels regularly",
-                "substitution_allowed": True
-            }
-        ]
-    }
-    
+    args = parse_args()
+
+    if args.count < 1:
+        print(
+            "Error: --count must be positive",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.count > 10000:
+        print(
+            "Error: --count exceeds the limit of 10000",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
-        fhir_generator = PrescriptionFHIRGenerator()
-        
-        print("\n" + "="*80)
-        print("GENERATING FHIR PRESCRIPTION")
-        print("="*80)
-        fhir_bundle = fhir_generator.create_prescription(prescription_data)
-        
-        print("\n" + "="*80)
-        print("GENERATING EDIFACT-LIKE RESPONSE")
-        print("="*80)
-        edifact_response = fhir_generator.create_edifact_like_response()
-        
-        print("\n" + "="*80)
-        print("DUAL FORMAT RESPONSE (FHIR + EDIFACT-like)")
-        print("="*80)
-        dual_response = fhir_generator.get_dual_response()
-        
-        with open("prescription_fhir.json", "w") as f:
-            f.write(fhir_bundle)
-        print("\nFHIR Bundle saved to prescription_fhir.json")
-        
-        with open("prescription_edifact.json", "w") as f:
-            json.dump(edifact_response, f, indent=2)
-        print("EDIFACT-like response saved to prescription_edifact.json")
-        
-        with open("prescription_dual_response.json", "w") as f:
-            json.dump(dual_response, f, indent=2)
-        print("Dual format response saved to prescription_dual_response.json")
-        
-        print("\n" + "="*80)
-        print("RESPONSE SUMMARY")
-        print("="*80)
-        
-        fhir_data = json.loads(fhir_bundle)
-        resource_types = [entry["resource"]["resourceType"] for entry in fhir_data["entry"]]
-        print(f"\nFHIR Resources: {len(resource_types)}")
-        print("FHIR Resource types:", ", ".join(sorted(set(resource_types))))
-        
-        print(f"\nEDIFACT Segments: {edifact_response['segment_count']}")
-        segment_types = set(seg['segment'] for seg in edifact_response['segments'])
-        print("EDIFACT Segment types:", ", ".join(sorted(segment_types)))
-        
-        print(f"\nPatient: {prescription_data['patient']['name']} (ID: {prescription_data['patient']['patient_id']})")
-        print(f"Prescriber: {prescription_data['prescribing_doctor']['name']}")
-        print(f"Medications: {len(prescription_data['items'])} items")
-        print(f"Allergies: {len(prescription_data['patient']['allergies'])}")
-        print(f"Diagnoses: {len(prescription_data['patient']['diagnoses'])}")
-        
-        print("\n" + "="*80)
-        print("SAMPLE EDIFACT SEGMENTS (first 5):")
-        print("="*80)
-        for i, segment in enumerate(edifact_response['segments'][:5]):
-            print(f"\n{segment['segment']} - {segment['description']}")
-            for field in segment['fields']:
-                if isinstance(field['value'], list):
-                    subfields = []
-                    for subfield in field['value']:
-                        subfields.append(f"{subfield['tag']}: {subfield['value']}")
-                    print(f"  {field['tag']}: [{', '.join(subfields)}]")
-                else:
-                    print(f"  {field['tag']}: {field['value']}")
-        
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+        bundle = generate_bundle(
+            args.count,
+            args.seed,
+        )
+
+        if args.stdout:
+            json.dump(
+                bundle,
+                sys.stdout,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            sys.stdout.write("\n")
+            return 0
+
+        save_bundle(
+            bundle,
+            args.output,
+            args.overwrite,
+        )
+
+        if not args.quiet:
+            print_summary(
+                bundle,
+                args.count,
+                args.output,
+            )
+
+        return 0
+
+    except (
+        ValueError,
+        OSError,
+        TypeError,
+    ) as exc:
+        print(
+            f"Error: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
